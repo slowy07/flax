@@ -20,6 +20,8 @@ This script trains a Transformer on a WMT dataset.
 # pytype: disable=wrong-arg-count
 # pytype: disable=attribute-error
 
+from typing import Optional
+
 import collections
 import functools
 import os
@@ -30,6 +32,7 @@ from clu import periodic_actions
 from flax import jax_utils
 from flax import linen as nn
 from flax import optim
+from flax import struct
 import bleu
 import decode
 import input_pipeline
@@ -181,7 +184,12 @@ def compute_metrics(logits, labels, weights, label_smoothing=0.0):
 # -----------------------------------------------------------------------------
 
 
-def train_step(optimizer,
+class TrainState(struct.PyTreeNode):
+  optimizer: optim.Optimizer
+  dynamic_scale: Optional[optim.DynamicScale]
+
+
+def train_step(train_state,
                batch,
                config,
                learning_rate_fn,
@@ -202,7 +210,8 @@ def train_step(optimizer,
 
   weights = jnp.where(targets > 0, 1, 0).astype(jnp.float32)
 
-  dropout_rng = jax.random.fold_in(dropout_rng, optimizer.state.step)
+  dropout_rng = jax.random.fold_in(
+      dropout_rng, train_state.optimizer.state.step)
 
   def loss_fn(params):
     """loss function used for training."""
@@ -220,17 +229,35 @@ def train_step(optimizer,
                                                       label_smoothing)
     mean_loss = loss / weight_sum
     return mean_loss, logits
-
+  optimizer = train_state.optimizer
   step = optimizer.state.step
   lr = learning_rate_fn(step)
-  grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-  (_, logits), grad = grad_fn(optimizer.target)
-  grad = jax.lax.pmean(grad, "batch")
-  new_optimizer = optimizer.apply_gradient(grad, learning_rate=lr)
+  if train_state.dynamic_scale:
+    grad_fn = train_state.dynamic_scale.value_and_grad(
+        loss_fn, has_aux=True, axis_name="batch")
+    dynamic_scale, is_fin, aux, grads = grad_fn(optimizer.target)
+    train_state = train_state.replace(dynamic_scale=dynamic_scale)
+    # dynamic loss takes care of averaging gradients across replicas
+  else:
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    aux, grads = grad_fn(optimizer.target)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+  (_, logits) = aux
+  new_optimizer = optimizer.apply_gradient(grads, learning_rate=lr)
   metrics = compute_metrics(logits, targets, weights)
   metrics["learning_rate"] = lr
-
-  return new_optimizer, metrics
+  train_state = train_state.replace(optimizer=new_optimizer)
+  if train_state.dynamic_scale:
+    # if is_fin == False the gradients contain Inf/NaNs and optimizer state and
+    # params should be restored (= skip this step).
+    train_state = train_state.replace(
+        optimizer=jax.tree_multimap(
+            functools.partial(jnp.where, is_fin),
+            train_state.optimizer,
+            optimizer)
+        )
+    metrics["scale"] = dynamic_scale.scale * metrics["denominator"]
+  return train_state, metrics
 
 
 def eval_step(params, batch, config, label_smoothing=0.0):
@@ -403,6 +430,16 @@ def translate_and_calculate_bleu(*, p_pred_step, p_init_cache, target,
   return exemplars, bleu_score
 
 
+def preferred_dtype(config):
+  platform = jax.local_devices()[0].platform
+  if config.use_mixed_precision:
+    if platform == "tpu":
+      return jnp.bfloat16
+    elif platform == "gpu":
+      return jnp.float16
+  return jnp.float32
+
+
 def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
   """Runs a training and evaluation loop.
 
@@ -448,7 +485,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       output_vocab_size=vocab_size,
       share_embeddings=config.share_embeddings,
       logits_via_embedding=config.logits_via_embedding,
-      dtype=jnp.bfloat16 if config.use_bfloat16 else jnp.float32,
+      dtype=preferred_dtype(config),
       emb_dim=config.emb_dim,
       num_heads=config.num_heads,
       num_layers=config.num_layers,
@@ -483,15 +520,20 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       eps=1e-9,
       weight_decay=config.weight_decay)
   optimizer = optimizer_def.create(initial_variables["params"])
+  dynamic_scale = None
+  if preferred_dtype(config) == jnp.float16:
+    dynamic_scale = optim.DynamicScale()
+  train_state = TrainState(optimizer, dynamic_scale)
 
-  # We access model params only from optimizer below via optimizer.target.
-  del initial_variables
+  # Do not keep references to initial values of the train state to avoid a
+  # memory leak
+  del initial_variables, optimizer, dynamic_scale
 
   if config.restore_checkpoints:
-    # Restore unreplicated optimizer + model state from last checkpoint.
-    optimizer = checkpoints.restore_checkpoint(workdir, optimizer)
+    # Restore unreplicated train state from last checkpoint.
+    train_state = checkpoints.restore_checkpoint(workdir, train_state)
     # Grab last step.
-    start_step = int(optimizer.state.step)
+    start_step = int(train_state.optimizer.state.step)
 
   writer = metric_writers.create_default_writer(
       workdir, just_logging=jax.process_index() > 0)
@@ -499,7 +541,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
     writer.write_hparams(dict(config))
 
   # Replicate optimizer.
-  optimizer = jax_utils.replicate(optimizer)
+  train_state = jax_utils.replicate(train_state)
 
   learning_rate_fn = create_learning_rate_scheduler(
       base_learning_rate=config.learning_rate, warmup_steps=config.warmup_steps)
@@ -554,8 +596,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       # Shard data to devices and do a training step.
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
         batch = common_utils.shard(jax.tree_map(np.asarray, next(train_iter)))
-        optimizer, metrics = p_train_step(
-            optimizer, batch, dropout_rng=dropout_rngs)
+        train_state, metrics = p_train_step(
+            train_state, batch, dropout_rng=dropout_rngs)
         train_metrics.append(metrics)
 
       # Quick indication that training is happening.
@@ -580,7 +622,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
         with report_progress.timed("eval"):
           eval_results = evaluate(
               p_eval_step=p_eval_step,
-              target=optimizer.target,
+              target=train_state.optimizer.target,
               eval_ds=eval_ds,
               num_eval_steps=config.num_eval_steps)
           writer.write_scalars(
@@ -590,7 +632,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
           exemplars, bleu_score = translate_and_calculate_bleu(
               p_pred_step=p_pred_step,
               p_init_cache=p_init_cache,
-              target=optimizer.target,
+              target=train_state.optimizer.target,
               predict_ds=predict_ds,
               decode_tokens=decode_tokens,
               max_predict_length=config.max_predict_length)
@@ -602,5 +644,5 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                          is_last_step)
       if config.save_checkpoints and save_checkpoint and jax.process_index() == 0:
         with report_progress.timed("checkpoint"):
-          checkpoints.save_checkpoint(workdir, jax_utils.unreplicate(optimizer),
-                                      step)
+          checkpoints.save_checkpoint(
+              workdir, jax_utils.unreplicate(train_state), step)

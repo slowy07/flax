@@ -40,12 +40,12 @@ def get_config():
   config.reverse_translation = False
 
   # Per device batch size for training.
-  config.per_device_batch_size = 64
+  config.per_device_batch_size = 32
 
   # Beam size for inference.
   config.beam_size = 4
 
-  config.num_train_steps = 100_000
+  config.num_train_steps = 14_000
 
   # Number of steps to take during evaluation.
   config.num_eval_steps = 20
@@ -54,7 +54,8 @@ def get_config():
   config.num_predict_steps = -1
 
   # Base learning rate.
-  config.learning_rate = 0.0625
+  # / 2 accounts for half batch size compared to default config
+  config.learning_rate = 0.0625 / 2
 
   # Linear learning rate warmup.
   config.warmup_steps = 1000

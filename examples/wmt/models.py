@@ -432,7 +432,7 @@ class Decoder(nn.Module):
     else:
       logits = nn.Dense(
           cfg.output_vocab_size,
-          dtype=cfg.dtype,
+          # dtype=cfg.dtype,
           kernel_init=cfg.kernel_init,
           bias_init=cfg.bias_init,
           name='logitdense')(y)
@@ -553,7 +553,8 @@ class Transformer(nn.Module):
         targets_positions=targets_positions,
         decoder_mask=decoder_mask,
         encoder_decoder_mask=encoder_decoder_mask)
-    return logits.astype(self.config.dtype)
+    return logits
+    # return logits.astype(self.config.dtype)
 
   def __call__(self,
                inputs,
